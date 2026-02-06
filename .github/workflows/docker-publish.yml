@@ -1,0 +1,92 @@
+name: Build and Publish Docker Images
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    # Weekly builds to catch upstream updates
+    - cron: '0 2 * * 1'
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: keymetrics/pm2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ['18', '20', '22', '24', 'latest']
+        variant: ['alpine', 'bookworm', 'bullseye', 'buster', 'slim']
+        exclude:
+          # Remove buster for Node 22+ as it's deprecated
+          - node-version: '22'
+            variant: 'buster'
+          - node-version: '24'
+            variant: 'buster'
+          # Remove bullseye for Node 24 as bookworm is preferred
+          - node-version: '24'
+            variant: 'bullseye'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=${{ matrix.node-version }}-${{ matrix.variant }}
+
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        context: ./tags/${{ matrix.node-version }}/${{ matrix.variant }}
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        tag: ['latest-alpine', 'latest-slim', '20-alpine', '22-alpine', '24-alpine']
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Test Docker image
+      run: |
+        cd example-app
+        # Update Dockerfile to use the built image
+        sed -i "s|keymetrics/pm2:latest-alpine|keymetrics/pm2:${{ matrix.tag }}|g" Dockerfile
+        
+        # Build test image
+        docker build -t test-pm2:${{ matrix.tag }} .
+        
+        # Run basic tests
+        docker run --rm test-pm2:${{ matrix.tag }} pm2 --version
+        
+        # Test multi-arch support
+        docker manifest inspect keymetrics/pm2:${{ matrix.tag }}
